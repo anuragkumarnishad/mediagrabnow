@@ -101,11 +101,41 @@ function extractMedia(node, out) {
 
   // API v1 style
   if (Array.isArray(node.video_versions) && node.video_versions.length) {
-    const best = node.video_versions[0];
-    out.push({ type: 'video', quality: (best.height || '') + 'p', url: best.url, thumb: (node.image_versions2 && node.image_versions2.candidates && node.image_versions2.candidates[0] && node.image_versions2.candidates[0].url) || '' });
+    const thumb = (node.image_versions2 && node.image_versions2.candidates && node.image_versions2.candidates[0] && node.image_versions2.candidates[0].url) || '';
+    // Instagram usually serves one video resolution; pick the best, dedupe by height
+    const seenH = new Set();
+    const vids = [];
+    node.video_versions.forEach((v) => {
+      const h = v.height || 0;
+      if (!seenH.has(h)) { seenH.add(h); vids.push({ height: h, url: v.url }); }
+    });
+    vids.sort((a, b) => b.height - a.height);
+    const best = vids[0];
+    out.push({
+      type: 'video',
+      quality: best.height ? best.height + 'p' : 'HD',
+      url: best.url,
+      thumb,
+      variants: vids.map((v) => ({ label: (v.height ? v.height + 'p' : 'HD'), url: v.url })),
+    });
   } else if (node.image_versions2 && node.image_versions2.candidates && node.image_versions2.candidates.length && !node.video_versions) {
-    const best = node.image_versions2.candidates[0];
-    out.push({ type: 'image', quality: (best.height || '') + 'px', url: best.url, thumb: best.url });
+    const cands = node.image_versions2.candidates;
+    const best = cands[0];
+    // build quality variants from all candidate sizes (dedupe by width)
+    const seenW = new Set();
+    const variants = [];
+    cands.forEach((c) => {
+      const w = c.width || 0;
+      if (!seenW.has(w)) { seenW.add(w); variants.push({ label: (c.width && c.height ? c.width + 'x' + c.height : 'img'), w, url: c.url }); }
+    });
+    variants.sort((a, b) => b.w - a.w);
+    out.push({
+      type: 'image',
+      quality: (best.width ? best.width + 'px' : 'Full'),
+      url: best.url,
+      thumb: best.url,
+      variants: variants.map((v) => ({ label: v.label, url: v.url })),
+    });
   }
 
   // Carousel children
