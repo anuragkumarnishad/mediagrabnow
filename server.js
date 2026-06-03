@@ -10,6 +10,27 @@
 const express = require('express');
 const path = require('path');
 
+// ---- Proxy support (to avoid Instagram blocking datacenter IPs) ----
+// Set PROXY_URL in Render env, e.g.  http://user:pass@host:port
+// Works with residential/rotating proxies (Webshare, BrightData, IPRoyal, etc.)
+let proxyDispatcher = null;
+const PROXY_URL = process.env.PROXY_URL || '';
+if (PROXY_URL) {
+  try {
+    const { ProxyAgent } = require('undici');
+    proxyDispatcher = new ProxyAgent(PROXY_URL);
+    console.log('🌐 Using proxy for Instagram requests.');
+  } catch (e) {
+    console.warn('⚠️ Could not init proxy:', e.message);
+  }
+}
+
+// Wrapper around fetch that routes through the proxy when configured
+function igFetch(url, opts = {}) {
+  if (proxyDispatcher) return fetch(url, Object.assign({}, opts, { dispatcher: proxyDispatcher }));
+  return fetch(url, opts);
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -30,6 +51,30 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
+// ---- Instagram login cookie (FREE method) ----
+// Paste your logged-in Instagram cookie string in Render env: IG_COOKIE
+// Use a DUMMY/throwaway IG account (ban risk). How to get it: see COOKIE.md
+const IG_COOKIE = process.env.IG_COOKIE || '';
+// Extract csrftoken from the cookie (Instagram needs it as a header)
+const IG_CSRF = (IG_COOKIE.match(/csrftoken=([^;]+)/) || [])[1] || '';
+
+// Build headers that include the login cookie when available
+function igHeaders(extra) {
+  const h = Object.assign(
+    {
+      'User-Agent': UA,
+      Accept: '*/*',
+      'X-IG-App-ID': '936619743392459',
+    },
+    extra || {}
+  );
+  if (IG_COOKIE) {
+    h['Cookie'] = IG_COOKIE;
+    if (IG_CSRF) h['X-CSRFToken'] = IG_CSRF;
+  }
+  return h;
+}
 
 function cleanUrl(u) {
   try {
@@ -93,34 +138,59 @@ function parseIgJson(json) {
 // 2) Subscribe to a free plan, copy your key
 // 3) Set it below or via env:  RAPIDAPI_KEY=xxxx npm start
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || '';            // <-- paste your key here
-const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || 'instagram-downloader-download-instagram-videos-stories.p.rapidapi.com';
+const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || 'instagram120.p.rapidapi.com';
 
 async function fetchViaRapidAPI(rawUrl) {
   if (!RAPIDAPI_KEY) return null; // not configured
+
+  // instagram120 API: POST /api/instagram/links  body {url}
+  // Response: [ { urls:[{url,name,subName,extension,quality}], meta:{title,sourceUrl}, pictureUrl } ]
   try {
-    const endpoint =
-      'https://' + RAPIDAPI_HOST + '/index?url=' + encodeURIComponent(rawUrl);
-    const res = await fetch(endpoint, {
+    const res = await fetch('https://' + RAPIDAPI_HOST + '/api/instagram/links', {
+      method: 'POST',
       headers: {
-        'X-RapidAPI-Key': RAPIDAPI_KEY,
-        'X-RapidAPI-Host': RAPIDAPI_HOST,
+        'Content-Type': 'application/json',
+        'x-rapidapi-key': RAPIDAPI_KEY,
+        'x-rapidapi-host': RAPIDAPI_HOST,
       },
+      body: JSON.stringify({ url: rawUrl }),
     });
     if (!res.ok) return null;
     const json = await res.json();
-    // Different APIs return different shapes; normalize the common ones:
-    const media = [];
-    const push = (type, url, thumb, q) => { if (url) media.push({ type, url, thumb: thumb || '', quality: q || 'HD' }); };
+    const items = Array.isArray(json) ? json : json && json.result ? json.result : [];
+    if (!items.length) return null;
 
-    if (Array.isArray(json.media)) {
-      json.media.forEach((m) => push(m.type === 'image' ? 'image' : 'video', m.url || m.download_url, m.thumbnail, m.quality));
-    } else if (Array.isArray(json)) {
-      json.forEach((m) => push(m.type === 'image' ? 'image' : 'video', m.url || m.download_url, m.thumbnail, m.quality));
-    } else {
-      if (json.video || json.video_url) push('video', json.video || json.video_url, json.thumbnail || json.thumb, 'HD');
-      if (json.image || json.image_url || json.thumbnail) push('image', json.image || json.image_url || json.thumbnail, json.thumbnail, 'Full');
-    }
-    if (media.length) return { title: json.title || 'Instagram post', media };
+    const media = [];
+    let title = 'Instagram post';
+
+    items.forEach((it) => {
+      if (it && it.meta && it.meta.title && title === 'Instagram post') {
+        title = String(it.meta.title).slice(0, 90);
+      }
+      const thumb = it.pictureUrl || it.thumbnail || (it.meta && it.meta.pictureUrl) || '';
+      const variants = Array.isArray(it.urls) ? it.urls : [];
+      if (variants.length) {
+        // pick the best video variant (highest quality) for this item
+        const vids = variants.filter((v) => (v.extension || '').toLowerCase() === 'mp4' || (v.name || '').toUpperCase() === 'MP4');
+        const imgs = variants.filter((v) => /jpg|jpeg|png|webp/i.test(v.extension || '') || /image|photo/i.test(v.name || ''));
+        if (vids.length) {
+          vids.sort((a, b) => (b.quality || 0) - (a.quality || 0));
+          const best = vids[0];
+          media.push({ type: 'video', url: best.url, thumb, quality: best.subName || (best.quality ? best.quality + 'p' : 'HD') });
+        } else if (imgs.length) {
+          media.push({ type: 'image', url: imgs[0].url, thumb: thumb || imgs[0].url, quality: 'Full' });
+        } else {
+          // unknown variant -> take first url
+          media.push({ type: 'video', url: variants[0].url, thumb, quality: variants[0].subName || 'HD' });
+        }
+      } else if (thumb) {
+        media.push({ type: 'image', url: thumb, thumb, quality: 'Full' });
+      }
+    });
+
+    const seen = new Set();
+    const uniq = media.filter((m) => m.url && !seen.has(m.url) && seen.add(m.url));
+    if (uniq.length) return { title, media: uniq };
     return null;
   } catch (e) {
     return null;
@@ -149,7 +219,7 @@ async function fetchViaDocId(shortcode, baseHeaders) {
         encodeURIComponent(JSON.stringify({ shortcode })) +
         '&doc_id=' +
         docId;
-      const res = await fetch('https://www.instagram.com/graphql/query', {
+      const res = await igFetch('https://www.instagram.com/graphql/query', {
         method: 'POST',
         headers,
         body,
@@ -185,11 +255,7 @@ async function fetchViaDocId(shortcode, baseHeaders) {
 async function fetchInstagram(rawUrl) {
   const base = cleanUrl(rawUrl);
   const shortcode = getShortcode(base);
-  const headers = {
-    'User-Agent': UA,
-    Accept: '*/*',
-    'X-IG-App-ID': '936619743392459',
-  };
+  const headers = igHeaders();
 
   // 0) Try RapidAPI first (only if a key is configured)
   const viaApi = await fetchViaRapidAPI(base);
@@ -203,7 +269,7 @@ async function fetchInstagram(rawUrl) {
 
   // 1) public JSON view
   try {
-    const res = await fetch(base + '/?__a=1&__d=dis', { headers });
+    const res = await igFetch(base + '/?__a=1&__d=dis', { headers });
     if (res.ok) {
       const txt = await res.text();
       try {
@@ -220,7 +286,7 @@ async function fetchInstagram(rawUrl) {
       'https://www.instagram.com/graphql/query/?query_hash=9f8827793ef34641b2fb195d4d41151c&variables=' +
       encodeURIComponent(JSON.stringify({ shortcode }));
     try {
-      const res = await fetch(gql, { headers });
+      const res = await igFetch(gql, { headers });
       if (res.ok) {
         const json = await res.json();
         const media = parseIgJson(
@@ -231,21 +297,75 @@ async function fetchInstagram(rawUrl) {
     } catch (e) {}
   }
 
-  // 3) scrape the page HTML for og:video / og:image as a last resort
+  // 3) scrape the page HTML (works when proxy returns the real page)
   try {
-    const res = await fetch(base + '/', { headers });
+    const res = await igFetch(base + '/', { headers });
     if (res.ok) {
       const html = await res.text();
-      const media = [];
-      const vid = html.match(/property="og:video" content="([^"]+)"/);
-      const img = html.match(/property="og:image" content="([^"]+)"/);
-      if (vid) media.push({ type: 'video', quality: 'HD', url: decodeHtml(vid[1]), thumb: img ? decodeHtml(img[1]) : '' });
-      else if (img) media.push({ type: 'image', quality: 'Full', url: decodeHtml(img[1]), thumb: decodeHtml(img[1]) });
+      const media = parseHtml(html);
       if (media.length) return { title: 'Instagram post', media };
     }
   } catch (e) {}
 
   return { title: '', media: [] };
+}
+
+// Extract media from a full Instagram HTML page (embedded JSON + og tags)
+function parseHtml(html) {
+  const media = [];
+  const push = (type, url, thumb, q) => {
+    if (url) media.push({ type, url: decodeUnicode(decodeHtml(url)), thumb: thumb ? decodeUnicode(decodeHtml(thumb)) : '', quality: q || 'HD' });
+  };
+
+  // a) modern embedded JSON: "video_versions":[{"url":"..."}]
+  let m = html.match(/"video_versions":\s*\[\s*\{[^}]*?"url":"([^"]+)"/);
+  if (m) push('video', m[1], (html.match(/"image_versions2".*?"url":"([^"]+)"/) || [])[1], '1080p');
+
+  // b) "video_url":"..."
+  if (!media.length) {
+    m = html.match(/"video_url":"([^"]+)"/);
+    if (m) push('video', m[1], (html.match(/"display_url":"([^"]+)"/) || [])[1]);
+  }
+
+  // c) JSON-LD contentUrl
+  if (!media.length) {
+    m = html.match(/"contentUrl":\s*"([^"]+\.mp4[^"]*)"/);
+    if (m) push('video', m[1], (html.match(/"thumbnailUrl":\s*"([^"]+)"/) || [])[1]);
+  }
+
+  // d) any cdn mp4 in the page
+  if (!media.length) {
+    m = html.match(/https:\\?\/\\?\/[^"']*\.mp4[^"']*/);
+    if (m) push('video', m[0]);
+  }
+
+  // e) image-only post
+  if (!media.length) {
+    const og = html.match(/property="og:image" content="([^"]+)"/);
+    const di = html.match(/"display_url":"([^"]+)"/);
+    if (di) push('image', di[1], di[1], 'Full');
+    else if (og) push('image', og[1], og[1], 'Full');
+  }
+
+  // f) og:video fallback
+  if (!media.length) {
+    const ov = html.match(/property="og:video" content="([^"]+)"/);
+    if (ov) push('video', ov[1], (html.match(/property="og:image" content="([^"]+)"/) || [])[1]);
+  }
+
+  // dedupe
+  const seen = new Set();
+  return media.filter((x) => x.url && !seen.has(x.url) && seen.add(x.url));
+}
+
+// decode \u002F etc. and escaped slashes from embedded JSON strings
+function decodeUnicode(s) {
+  if (!s) return s;
+  return s
+    .replace(/\\u0026/g, '&')
+    .replace(/\\u003D/gi, '=')
+    .replace(/\\u002F/gi, '/')
+    .replace(/\\\//g, '/');
 }
 
 function decodeHtml(s) {
@@ -283,7 +403,7 @@ app.get('/api/file', async (req, res) => {
   const name = req.query.name || 'mediagrabnow';
   if (!u) return res.status(400).send('Missing url');
   try {
-    const upstream = await fetch(u, { headers: { 'User-Agent': UA } });
+    const upstream = await igFetch(u, { headers: igHeaders() });
     if (!upstream.ok) return res.status(502).send('Upstream error');
     res.setHeader('Content-Disposition', 'attachment; filename="' + name + '"');
     res.setHeader('Content-Type', upstream.headers.get('content-type') || 'application/octet-stream');
@@ -306,13 +426,23 @@ app.get('/api/debug', async (req, res) => {
   if (!u) return res.json({ error: 'Add ?url=<instagram link>' });
   const base = cleanUrl(u);
   const shortcode = getShortcode(base);
-  const headers = { 'User-Agent': UA, Accept: '*/*', 'X-IG-App-ID': '936619743392459' };
-  const report = { shortcode, steps: [] };
+  const headers = igHeaders();
+  const report = { shortcode, cookie: IG_COOKIE ? 'ON' : 'OFF', proxy: PROXY_URL ? 'ON' : 'OFF', rapidapi: RAPIDAPI_KEY ? 'ON' : 'OFF', steps: [] };
+
+  // RapidAPI direct test
+  if (RAPIDAPI_KEY) {
+    try {
+      const r = await fetchViaRapidAPI(base);
+      report.steps.push({ method: 'rapidapi', mediaFound: r ? r.media.length : 0 });
+    } catch (e) {
+      report.steps.push({ method: 'rapidapi', error: e.message });
+    }
+  }
 
   // doc_id
   try {
     const body = 'variables=' + encodeURIComponent(JSON.stringify({ shortcode })) + '&doc_id=24368985919464652';
-    const r = await fetch('https://www.instagram.com/graphql/query', {
+    const r = await igFetch('https://www.instagram.com/graphql/query', {
       method: 'POST',
       headers: Object.assign({}, headers, {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -328,7 +458,7 @@ app.get('/api/debug', async (req, res) => {
 
   // ?__a=1
   try {
-    const r = await fetch(base + '/?__a=1&__d=dis', { headers });
+    const r = await igFetch(base + '/?__a=1&__d=dis', { headers });
     report.steps.push({ method: '__a=1', status: r.status });
   } catch (e) {
     report.steps.push({ method: '__a=1', error: e.message });
@@ -336,7 +466,7 @@ app.get('/api/debug', async (req, res) => {
 
   // og:scrape
   try {
-    const r = await fetch(base + '/', { headers });
+    const r = await igFetch(base + '/', { headers });
     report.steps.push({ method: 'html', status: r.status });
   } catch (e) {
     report.steps.push({ method: 'html', error: e.message });
