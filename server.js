@@ -14,6 +14,18 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
+
+// ---- CORS (frontend Netlify, backend Render = different domains) ----
+// Production me ALLOWED_ORIGIN env var set karo, e.g. https://mediagrabnow.com
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 const UA =
@@ -115,6 +127,61 @@ async function fetchViaRapidAPI(rawUrl) {
   }
 }
 
+// BEST METHOD: mimic Instagram web browser GraphQL request (no auth required)
+// Uses the public doc_id endpoint that returns xdt_api__v1__media__shortcode__web_info
+async function fetchViaDocId(shortcode, baseHeaders) {
+  // A few doc_id values used by IG web for shortcode media info.
+  // If one stops working, the others or fallbacks below still try.
+  const docIds = ['24368985919464652', '8845758582119845', '10015901848480474'];
+  const headers = Object.assign({}, baseHeaders, {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'X-IG-App-ID': '936619743392459',
+    'X-FB-LSD': 'AVqbxe3J_YA',
+    'Sec-Fetch-Site': 'same-origin',
+    Origin: 'https://www.instagram.com',
+    Referer: 'https://www.instagram.com/',
+  });
+
+  for (const docId of docIds) {
+    try {
+      const body =
+        'variables=' +
+        encodeURIComponent(JSON.stringify({ shortcode })) +
+        '&doc_id=' +
+        docId;
+      const res = await fetch('https://www.instagram.com/graphql/query', {
+        method: 'POST',
+        headers,
+        body,
+      });
+      if (!res.ok) continue;
+      const json = await res.json();
+      const item =
+        json &&
+        json.data &&
+        json.data.xdt_api__v1__media__shortcode__web_info &&
+        json.data.xdt_api__v1__media__shortcode__web_info.items &&
+        json.data.xdt_api__v1__media__shortcode__web_info.items[0];
+      if (item) {
+        const out = [];
+        extractMedia(item, out);
+        // dedupe
+        const seen = new Set();
+        const media = out.filter((m) => m.url && !seen.has(m.url) && seen.add(m.url));
+        if (media.length) {
+          const title =
+            (item.caption && item.caption.text && item.caption.text.slice(0, 80)) ||
+            'Instagram post';
+          return { title, media };
+        }
+      }
+    } catch (e) {
+      /* try next doc_id */
+    }
+  }
+  return { title: '', media: [] };
+}
+
 async function fetchInstagram(rawUrl) {
   const base = cleanUrl(rawUrl);
   const shortcode = getShortcode(base);
@@ -124,9 +191,15 @@ async function fetchInstagram(rawUrl) {
     'X-IG-App-ID': '936619743392459',
   };
 
-  // 0) Try RapidAPI first (most reliable for public + most reels)
+  // 0) Try RapidAPI first (only if a key is configured)
   const viaApi = await fetchViaRapidAPI(base);
   if (viaApi && viaApi.media.length) return viaApi;
+
+  // 0.5) BEST METHOD (2026): Instagram GraphQL doc_id endpoint, no login needed
+  if (shortcode) {
+    const viaDoc = await fetchViaDocId(shortcode, headers);
+    if (viaDoc && viaDoc.media.length) return viaDoc;
+  }
 
   // 1) public JSON view
   try {
@@ -192,10 +265,11 @@ app.post('/api/download', async (req, res) => {
   try {
     const { title, media } = await fetchInstagram(url);
     if (!media.length) {
-      const hint = RAPIDAPI_KEY
-        ? 'Could not fetch media. The post may be private, deleted, or the API has no data. Try a public post/reel.'
-        : 'Could not fetch media. Instagram now blocks anonymous requests. Add a free RAPIDAPI_KEY in server.js to enable real downloads (see README.md).';
-      return res.json({ success: false, error: hint });
+      return res.json({
+        success: false,
+        error:
+          'Could not fetch this media. Make sure the post/reel is PUBLIC and the link is correct. (Instagram may also be rate-limiting this server — try again in a moment.)',
+      });
     }
     res.json({ success: true, title, media });
   } catch (e) {
@@ -224,6 +298,59 @@ app.get('/api/file', async (req, res) => {
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// ---- Debug: see which Instagram method works from THIS server's IP ----
+// Visit: https://your-app.onrender.com/api/debug?url=<instagram link>
+app.get('/api/debug', async (req, res) => {
+  const u = req.query.url;
+  if (!u) return res.json({ error: 'Add ?url=<instagram link>' });
+  const base = cleanUrl(u);
+  const shortcode = getShortcode(base);
+  const headers = { 'User-Agent': UA, Accept: '*/*', 'X-IG-App-ID': '936619743392459' };
+  const report = { shortcode, steps: [] };
+
+  // doc_id
+  try {
+    const body = 'variables=' + encodeURIComponent(JSON.stringify({ shortcode })) + '&doc_id=24368985919464652';
+    const r = await fetch('https://www.instagram.com/graphql/query', {
+      method: 'POST',
+      headers: Object.assign({}, headers, {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Origin: 'https://www.instagram.com',
+        Referer: 'https://www.instagram.com/',
+      }),
+      body,
+    });
+    report.steps.push({ method: 'doc_id', status: r.status });
+  } catch (e) {
+    report.steps.push({ method: 'doc_id', error: e.message });
+  }
+
+  // ?__a=1
+  try {
+    const r = await fetch(base + '/?__a=1&__d=dis', { headers });
+    report.steps.push({ method: '__a=1', status: r.status });
+  } catch (e) {
+    report.steps.push({ method: '__a=1', error: e.message });
+  }
+
+  // og:scrape
+  try {
+    const r = await fetch(base + '/', { headers });
+    report.steps.push({ method: 'html', status: r.status });
+  } catch (e) {
+    report.steps.push({ method: 'html', error: e.message });
+  }
+
+  // final result
+  try {
+    const { media } = await fetchInstagram(base);
+    report.mediaFound = media.length;
+  } catch (e) {
+    report.fetchError = e.message;
+  }
+  res.json(report);
+});
 
 app.listen(PORT, () => {
   console.log('✅ MediaGrabNow running at http://localhost:' + PORT);
