@@ -550,7 +550,16 @@ app.post('/api/download', async (req, res) => {
       }
     }
 
-    res.json({ success: true, title: result.title || 'Instagram media', media: result.media });
+    // Decide a "kind" so the frontend can show the right shape
+    var kind = mode;
+    if (mode === 'profile' || mode === 'viewer') kind = 'profile';
+    else if (mode === 'story') kind = 'story';
+    else if (/\/reel|\/reels/i.test(input) || mode === 'reels') kind = 'reel';
+    else if (result.media.length > 1) kind = 'carousel';
+    else if (result.media[0] && result.media[0].type === 'image') kind = 'photo';
+    else kind = 'video';
+
+    res.json({ success: true, title: result.title || 'Instagram media', kind: kind, media: result.media });
   } catch (e) {
     res.status(500).json({ success: false, error: 'Server error: ' + e.message });
   }
