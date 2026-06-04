@@ -95,6 +95,16 @@ function getShortcode(u) {
 function extractMedia(node, out) {
   if (!node || typeof node !== 'object') return;
 
+  // If this node is a carousel/album, ONLY process its children (skip the cover)
+  const children =
+    (node.edge_sidecar_to_children && node.edge_sidecar_to_children.edges) ||
+    node.carousel_media ||
+    null;
+  if (Array.isArray(children) && children.length) {
+    children.forEach((c) => extractMedia(c.node || c, out));
+    return;
+  }
+
   // GraphQL style
   if (node.video_url) out.push({ type: 'video', quality: 'HD', url: node.video_url, thumb: node.display_url || node.thumbnail_src || '' });
   else if (node.display_url && node.is_video === false) out.push({ type: 'image', quality: 'Full', url: node.display_url, thumb: node.display_url });
@@ -136,15 +146,6 @@ function extractMedia(node, out) {
       thumb: best.url,
       variants: variants.map((v) => ({ label: v.label, url: v.url })),
     });
-  }
-
-  // Carousel children
-  const children =
-    (node.edge_sidecar_to_children && node.edge_sidecar_to_children.edges) ||
-    node.carousel_media ||
-    null;
-  if (Array.isArray(children)) {
-    children.forEach((c) => extractMedia(c.node || c, out));
   }
 }
 
@@ -321,7 +322,7 @@ async function fetchProfilePic(username) {
 }
 
 // ---- Stories by username ----
-async function fetchStories(username) {
+async function fetchStories(username, storyId) {
   username = String(username).replace(/^@/, '').trim();
   // first get the user id
   let uid = '';
@@ -363,8 +364,13 @@ async function fetchStories(username) {
         (json && json.reels_media && json.reels_media[0]) ||
         (json && json.reel) ||
         json;
-      const items = (reel && reel.items) || [];
+      let items = (reel && reel.items) || [];
       if (!items.length) continue;
+      // if a specific story id was given, keep only that one
+      if (storyId) {
+        const only = items.filter((it) => String(it.pk || it.id || '').indexOf(storyId) === 0 || String(it.pk) === storyId);
+        if (only.length) items = only;
+      }
       const media = [];
       items.forEach((it) => extractMedia(it, media));
       const seen = new Set();
@@ -380,15 +386,15 @@ async function fetchInstagram(rawUrl) {
   const shortcode = getShortcode(base);
   const headers = igHeaders();
 
-  // 0) Try RapidAPI first (only if a key is configured)
-  const viaApi = await fetchViaRapidAPI(base);
-  if (viaApi && viaApi.media.length) return viaApi;
-
-  // 0.5) BEST METHOD (2026): Instagram GraphQL doc_id endpoint, no login needed
+  // 0) BEST METHOD: Instagram GraphQL doc_id (cookie) — returns FULL carousel
   if (shortcode) {
     const viaDoc = await fetchViaDocId(shortcode, headers);
     if (viaDoc && viaDoc.media.length) return viaDoc;
   }
+
+  // 0.5) RapidAPI fallback (only if a key is configured)
+  const viaApi = await fetchViaRapidAPI(base);
+  if (viaApi && viaApi.media.length) return viaApi;
 
   // 1) public JSON view
   try {
@@ -513,10 +519,18 @@ app.post('/api/download', async (req, res) => {
 
     // username helper: pull @name or plain name from a profile URL or raw text
     const usernameFromInput = () => {
+      // stories link: instagram.com/stories/<username>/<id>
+      var sm = input.match(/instagram\.com\/stories\/([A-Za-z0-9._]+)/i);
+      if (sm) return sm[1];
       const m = input.match(/instagram\.com\/([A-Za-z0-9._]+)/);
-      if (m && !/^(p|reel|reels|tv|stories|explore)$/i.test(m[1])) return m[1];
+      if (m && !/^(p|reel|reels|tv|stories|explore|s)$/i.test(m[1])) return m[1];
       if (/^@?[A-Za-z0-9._]+$/.test(input)) return input;
       return '';
+    };
+    // specific story id (if a direct story link was pasted)
+    const storyIdFromInput = () => {
+      var sm = input.match(/instagram\.com\/stories\/[A-Za-z0-9._]+\/(\d+)/i);
+      return sm ? sm[1] : '';
     };
 
     if (mode === 'profile' || mode === 'viewer') {
@@ -526,9 +540,9 @@ app.post('/api/download', async (req, res) => {
       if (!result.media.length) return res.json({ success: false, error: 'Could not fetch this profile. Check the username.' });
     } else if (mode === 'story') {
       const un = usernameFromInput();
-      if (!un) return res.json({ success: false, error: 'Enter the username whose public stories you want.' });
-      result = await fetchStories(un);
-      if (!result.media.length) return res.json({ success: false, error: 'No active public stories found for this user (or it is private).' });
+      if (!un) return res.json({ success: false, error: 'Paste a story link (instagram.com/stories/...) or enter a username.' });
+      result = await fetchStories(un, storyIdFromInput());
+      if (!result.media.length) return res.json({ success: false, error: 'No active public stories found (or the account is private / story expired).' });
     } else {
       // video / photo / reels / igtv / carousel / audio -> normal link flow
       if (!/instagram\.com/i.test(input)) {
