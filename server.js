@@ -351,11 +351,14 @@ async function fetchStories(username, storyId) {
     'https://i.instagram.com/api/v1/feed/reels_media/?reel_ids=' + uid,
     'https://i.instagram.com/api/v1/feed/user/' + uid + '/story/',
     'https://www.instagram.com/api/v1/feed/reels_media/?reel_ids=' + uid,
+    'https://www.instagram.com/api/v1/feed/user/' + uid + '/story/',
   ];
 
+  let sawAuthError = false;
   for (const ep of tryEndpoints) {
     try {
       const res = await igFetch(ep, { headers: mobileHeaders });
+      if (res.status === 403 || res.status === 401) { sawAuthError = true; continue; }
       if (!res.ok) continue;
       const json = await res.json();
       // reels_media shape OR single story shape
@@ -378,7 +381,7 @@ async function fetchStories(username, storyId) {
       if (uniq.length) return { title: '@' + username + ' — stories', media: uniq };
     } catch (e) {}
   }
-  return { title: '', media: [] };
+  return { title: '', media: [], authError: sawAuthError };
 }
 
 async function fetchInstagram(rawUrl) {
@@ -542,7 +545,10 @@ app.post('/api/download', async (req, res) => {
       const un = usernameFromInput();
       if (!un) return res.json({ success: false, error: 'Paste a story link (instagram.com/stories/...) or enter a username.' });
       result = await fetchStories(un, storyIdFromInput());
-      if (!result.media.length) return res.json({ success: false, error: 'No active public stories found (or the account is private / story expired).' });
+      if (!result.media.length) {
+        if (result.authError) return res.json({ success: false, error: 'Login session expired on the server. The site admin needs to refresh the IG_COOKIE.' });
+        return res.json({ success: false, error: 'No active public stories found for this user (they may have no story right now, or the account is private).' });
+      }
     } else {
       // video / photo / reels / igtv / carousel / audio -> normal link flow
       if (!/instagram\.com/i.test(input)) {
