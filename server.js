@@ -337,22 +337,42 @@ async function fetchStories(username) {
   } catch (e) {}
   if (!uid) return { title: '', media: [] };
 
-  try {
-    const res = await igFetch('https://i.instagram.com/api/v1/feed/reels_media/?reel_ids=' + uid, {
-      headers: igHeaders({ 'User-Agent': 'Instagram 269.0.0.18.75 Android' }),
-    });
-    if (!res.ok) return { title: '', media: [] };
-    const json = await res.json();
-    const reel = json && json.reels && json.reels[uid];
-    const items = (reel && reel.items) || [];
-    const media = [];
-    items.forEach((it) => extractMedia(it, media));
-    const seen = new Set();
-    const uniq = media.filter((m) => m.url && !seen.has(m.url) && seen.add(m.url));
-    return { title: '@' + username + ' — stories', media: uniq };
-  } catch (e) {
-    return { title: '', media: [] };
+  // Full Android app headers make the private mobile API accept the session
+  const mobileHeaders = igHeaders({
+    'User-Agent':
+      'Instagram 269.0.0.18.75 Android (29/10; 420dpi; 1080x2129; samsung; SM-G973F; beyond1; exynos9820; en_US; 314665256)',
+    'X-IG-App-ID': '936619743392459',
+    'X-IG-Capabilities': '3brTvw==',
+    'Accept-Language': 'en-US',
+  });
+
+  const tryEndpoints = [
+    'https://i.instagram.com/api/v1/feed/reels_media/?reel_ids=' + uid,
+    'https://i.instagram.com/api/v1/feed/user/' + uid + '/story/',
+    'https://www.instagram.com/api/v1/feed/reels_media/?reel_ids=' + uid,
+  ];
+
+  for (const ep of tryEndpoints) {
+    try {
+      const res = await igFetch(ep, { headers: mobileHeaders });
+      if (!res.ok) continue;
+      const json = await res.json();
+      // reels_media shape OR single story shape
+      const reel =
+        (json && json.reels && json.reels[uid]) ||
+        (json && json.reels_media && json.reels_media[0]) ||
+        (json && json.reel) ||
+        json;
+      const items = (reel && reel.items) || [];
+      if (!items.length) continue;
+      const media = [];
+      items.forEach((it) => extractMedia(it, media));
+      const seen = new Set();
+      const uniq = media.filter((m) => m.url && !seen.has(m.url) && seen.add(m.url));
+      if (uniq.length) return { title: '@' + username + ' — stories', media: uniq };
+    } catch (e) {}
   }
+  return { title: '', media: [] };
 }
 
 async function fetchInstagram(rawUrl) {
