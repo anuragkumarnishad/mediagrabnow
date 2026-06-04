@@ -282,6 +282,79 @@ async function fetchViaDocId(shortcode, baseHeaders) {
   return { title: '', media: [] };
 }
 
+// ---- Profile picture by username ----
+async function fetchProfilePic(username) {
+  username = String(username).replace(/^@/, '').trim();
+  try {
+    const res = await igFetch(
+      'https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(username),
+      { headers: igHeaders({ Referer: 'https://www.instagram.com/' + username + '/' }) }
+    );
+    if (res.ok) {
+      const json = await res.json();
+      const u = json && json.data && json.data.user;
+      const pic = u && (u.profile_pic_url_hd || u.profile_pic_url);
+      if (pic) {
+        return {
+          title: '@' + u.username + (u.full_name ? ' — ' + u.full_name : ''),
+          media: [{ type: 'image', quality: 'HD', url: pic, thumb: pic }],
+          userId: u.id,
+        };
+      }
+    }
+  } catch (e) {}
+
+  // Fallback: scrape profile page for og:image (when API is rate-limited)
+  try {
+    const r = await igFetch('https://www.instagram.com/' + username + '/', { headers: igHeaders() });
+    if (r.ok) {
+      const html = await r.text();
+      const og = html.match(/property="og:image" content="([^"]+)"/);
+      if (og) {
+        const pic = decodeHtml(og[1]);
+        return { title: '@' + username, media: [{ type: 'image', quality: 'HD', url: pic, thumb: pic }] };
+      }
+    }
+  } catch (e) {}
+
+  return { title: '', media: [] };
+}
+
+// ---- Stories by username ----
+async function fetchStories(username) {
+  username = String(username).replace(/^@/, '').trim();
+  // first get the user id
+  let uid = '';
+  try {
+    const r = await igFetch(
+      'https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(username),
+      { headers: igHeaders({ Referer: 'https://www.instagram.com/' + username + '/' }) }
+    );
+    if (r.ok) {
+      const j = await r.json();
+      uid = j && j.data && j.data.user && j.data.user.id;
+    }
+  } catch (e) {}
+  if (!uid) return { title: '', media: [] };
+
+  try {
+    const res = await igFetch('https://i.instagram.com/api/v1/feed/reels_media/?reel_ids=' + uid, {
+      headers: igHeaders({ 'User-Agent': 'Instagram 269.0.0.18.75 Android' }),
+    });
+    if (!res.ok) return { title: '', media: [] };
+    const json = await res.json();
+    const reel = json && json.reels && json.reels[uid];
+    const items = (reel && reel.items) || [];
+    const media = [];
+    items.forEach((it) => extractMedia(it, media));
+    const seen = new Set();
+    const uniq = media.filter((m) => m.url && !seen.has(m.url) && seen.add(m.url));
+    return { title: '@' + username + ' — stories', media: uniq };
+  } catch (e) {
+    return { title: '', media: [] };
+  }
+}
+
 async function fetchInstagram(rawUrl) {
   const base = cleanUrl(rawUrl);
   const shortcode = getShortcode(base);
@@ -408,20 +481,56 @@ function decodeHtml(s) {
 
 // ---- API: resolve a link to media URLs ----
 app.post('/api/download', async (req, res) => {
-  const { url } = req.body || {};
-  if (!url || !/instagram\.com/i.test(url)) {
-    return res.status(400).json({ success: false, error: 'Please provide a valid Instagram URL.' });
+  const { url, type } = req.body || {};
+  if (!url || !String(url).trim()) {
+    return res.status(400).json({ success: false, error: 'Please paste a link or username.' });
   }
+  const input = String(url).trim();
+
   try {
-    const { title, media } = await fetchInstagram(url);
-    if (!media.length) {
-      return res.json({
-        success: false,
-        error:
-          'Could not fetch this media. Make sure the post/reel is PUBLIC and the link is correct. (Instagram may also be rate-limiting this server — try again in a moment.)',
-      });
+    let result = { title: '', media: [] };
+    const mode = (type || '').toLowerCase();
+
+    // username helper: pull @name or plain name from a profile URL or raw text
+    const usernameFromInput = () => {
+      const m = input.match(/instagram\.com\/([A-Za-z0-9._]+)/);
+      if (m && !/^(p|reel|reels|tv|stories|explore)$/i.test(m[1])) return m[1];
+      if (/^@?[A-Za-z0-9._]+$/.test(input)) return input;
+      return '';
+    };
+
+    if (mode === 'profile' || mode === 'viewer') {
+      const un = usernameFromInput();
+      if (!un) return res.json({ success: false, error: 'Enter an Instagram username (e.g. @nasa).' });
+      result = await fetchProfilePic(un);
+      if (!result.media.length) return res.json({ success: false, error: 'Could not fetch this profile. Check the username.' });
+    } else if (mode === 'story') {
+      const un = usernameFromInput();
+      if (!un) return res.json({ success: false, error: 'Enter the username whose public stories you want.' });
+      result = await fetchStories(un);
+      if (!result.media.length) return res.json({ success: false, error: 'No active public stories found for this user (or it is private).' });
+    } else {
+      // video / photo / reels / igtv / carousel / audio -> normal link flow
+      if (!/instagram\.com/i.test(input)) {
+        return res.json({ success: false, error: 'Please paste a valid Instagram link (instagram.com/...).' });
+      }
+      result = await fetchInstagram(input);
+      if (!result.media.length) {
+        return res.json({
+          success: false,
+          error: 'Could not fetch this media. Make sure the post/reel is PUBLIC and the link is correct.',
+        });
+      }
+      // audio mode: mark videos as audio so the frontend offers MP3-style download
+      if (mode === 'audio') {
+        result.media = result.media
+          .filter((m) => m.type === 'video')
+          .map((m) => ({ ...m, audio: true, quality: 'Audio (MP4)' }));
+        if (!result.media.length) return res.json({ success: false, error: 'No audio found (this post has no video).' });
+      }
     }
-    res.json({ success: true, title, media });
+
+    res.json({ success: true, title: result.title || 'Instagram media', media: result.media });
   } catch (e) {
     res.status(500).json({ success: false, error: 'Server error: ' + e.message });
   }
