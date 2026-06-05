@@ -324,6 +324,36 @@ async function fetchProfilePic(username) {
 // ---- Stories by username ----
 async function fetchStories(username, storyId) {
   username = String(username).replace(/^@/, '').trim();
+
+  const mobileHeaders = igHeaders({
+    'User-Agent':
+      'Instagram 269.0.0.18.75 Android (29/10; 420dpi; 1080x2129; samsung; SM-G973F; beyond1; exynos9820; en_US; 314665256)',
+    'X-IG-App-ID': '936619743392459',
+    'X-IG-Capabilities': '3brTvw==',
+    'Accept-Language': 'en-US',
+  });
+
+  let sawAuthError = false;
+
+  // FAST PATH: if a story link with a media id was pasted, fetch it directly
+  if (storyId) {
+    try {
+      const r = await igFetch('https://i.instagram.com/api/v1/media/' + storyId + '/info/', { headers: mobileHeaders });
+      if (r.status === 403 || r.status === 401) sawAuthError = true;
+      else if (r.ok) {
+        const j = await r.json();
+        const it = j && j.items && j.items[0];
+        if (it) {
+          const media = [];
+          extractMedia(it, media);
+          const seen = new Set();
+          const uniq = media.filter((m) => m.url && !seen.has(m.url) && seen.add(m.url));
+          if (uniq.length) return { title: '@' + username + ' — story', media: uniq };
+        }
+      }
+    } catch (e) {}
+  }
+
   // first get the user id
   let uid = '';
   try {
@@ -336,16 +366,7 @@ async function fetchStories(username, storyId) {
       uid = j && j.data && j.data.user && j.data.user.id;
     }
   } catch (e) {}
-  if (!uid) return { title: '', media: [] };
-
-  // Full Android app headers make the private mobile API accept the session
-  const mobileHeaders = igHeaders({
-    'User-Agent':
-      'Instagram 269.0.0.18.75 Android (29/10; 420dpi; 1080x2129; samsung; SM-G973F; beyond1; exynos9820; en_US; 314665256)',
-    'X-IG-App-ID': '936619743392459',
-    'X-IG-Capabilities': '3brTvw==',
-    'Accept-Language': 'en-US',
-  });
+  if (!uid) return { title: '', media: [], authError: sawAuthError };
 
   const tryEndpoints = [
     'https://i.instagram.com/api/v1/feed/reels_media/?reel_ids=' + uid,
@@ -354,7 +375,6 @@ async function fetchStories(username, storyId) {
     'https://www.instagram.com/api/v1/feed/user/' + uid + '/story/',
   ];
 
-  let sawAuthError = false;
   for (const ep of tryEndpoints) {
     try {
       const res = await igFetch(ep, { headers: mobileHeaders });
