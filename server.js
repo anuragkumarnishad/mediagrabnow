@@ -404,6 +404,43 @@ async function fetchStories(username, storyId) {
   return { title: '', media: [], authError: sawAuthError };
 }
 
+// ---- Highlights (instagram.com/stories/highlights/<id>/) ----
+async function fetchHighlights(highlightId) {
+  const mobileHeaders = igHeaders({
+    'User-Agent':
+      'Instagram 269.0.0.18.75 Android (29/10; 420dpi; 1080x2129; samsung; SM-G973F; beyond1; exynos9820; en_US; 314665256)',
+    'X-IG-App-ID': '936619743392459',
+    'X-IG-Capabilities': '3brTvw==',
+    'Accept-Language': 'en-US',
+  });
+  let sawAuthError = false;
+  const id = String(highlightId).replace(/^highlight:/, '');
+  const endpoints = [
+    'https://i.instagram.com/api/v1/feed/reels_media/?reel_ids=highlight:' + id,
+    'https://www.instagram.com/api/v1/feed/reels_media/?reel_ids=highlight:' + id,
+  ];
+  for (const ep of endpoints) {
+    try {
+      const res = await igFetch(ep, { headers: mobileHeaders });
+      if (res.status === 403 || res.status === 401) { sawAuthError = true; continue; }
+      if (!res.ok) continue;
+      const json = await res.json();
+      const reel =
+        (json && json.reels && json.reels['highlight:' + id]) ||
+        (json && json.reels && Object.values(json.reels)[0]) ||
+        null;
+      const items = (reel && reel.items) || [];
+      if (!items.length) continue;
+      const media = [];
+      items.forEach((it) => extractMedia(it, media));
+      const seen = new Set();
+      const uniq = media.filter((m) => m.url && !seen.has(m.url) && seen.add(m.url));
+      if (uniq.length) return { title: 'Instagram highlight', media: uniq };
+    } catch (e) {}
+  }
+  return { title: '', media: [], authError: sawAuthError };
+}
+
 async function fetchInstagram(rawUrl) {
   const base = cleanUrl(rawUrl);
   const shortcode = getShortcode(base);
@@ -555,6 +592,11 @@ app.post('/api/download', async (req, res) => {
       var sm = input.match(/instagram\.com\/stories\/[A-Za-z0-9._]+\/(\d+)/i);
       return sm ? sm[1] : '';
     };
+    // highlight id: instagram.com/stories/highlights/<id>/  OR  /s/<id>
+    const highlightIdFromInput = () => {
+      var hm = input.match(/instagram\.com\/stories\/highlights\/(\d+)/i) || input.match(/\/s\/([A-Za-z0-9_-]+)/i);
+      return hm ? hm[1] : '';
+    };
 
     if (mode === 'profile' || mode === 'viewer') {
       const un = usernameFromInput();
@@ -562,6 +604,17 @@ app.post('/api/download', async (req, res) => {
       result = await fetchProfilePic(un);
       if (!result.media.length) return res.json({ success: false, error: 'Could not fetch this profile. Check the username.' });
     } else if (mode === 'story') {
+      // highlight link?
+      const hid = highlightIdFromInput();
+      if (hid) {
+        result = await fetchHighlights(hid);
+        if (!result.media.length) {
+          if (result.authError) return res.json({ success: false, error: 'Server session expired. Admin needs to refresh IG_COOKIE.' });
+          return res.json({ success: false, error: 'Could not fetch this highlight. Make sure the link is correct and public.' });
+        }
+        res.json({ success: true, title: result.title || 'Instagram highlight', kind: 'story', media: result.media });
+        return;
+      }
       const un = usernameFromInput();
       if (!un) return res.json({ success: false, error: 'Paste a story link (instagram.com/stories/...) or enter a username.' });
       result = await fetchStories(un, storyIdFromInput());
@@ -626,6 +679,8 @@ app.get('/api/file', async (req, res) => {
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
+// lightweight keep-alive endpoint for UptimeRobot (prevents Render sleep)
+app.get('/ping', (_req, res) => res.status(200).send('pong'));
 
 // ---- Debug: see which Instagram method works from THIS server's IP ----
 // Visit: https://your-app.onrender.com/api/debug?url=<instagram link>
@@ -690,6 +745,6 @@ app.get('/api/debug', async (req, res) => {
   res.json(report);
 });
 
-app.listen(PORT, () => {
-  console.log('✅ MediaGrabNow running at http://localhost:' + PORT);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log('✅ MediaGrabNow running on port ' + PORT);
 });
