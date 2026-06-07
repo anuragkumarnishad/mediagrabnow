@@ -327,7 +327,7 @@ async function fetchStories(username, storyId) {
 
   const mobileHeaders = igHeaders({
     'User-Agent':
-      'Instagram 269.0.0.18.75 Android (29/10; 420dpi; 1080x2129; samsung; SM-G973F; beyond1; exynos9820; en_US; 314665256)',
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 12_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram 105.0.0.11.118 (iPhone11,8; iOS 12_3_1; en_US; en-US; scale=2.00; 828x1792; 165586599)',
     'X-IG-App-ID': '936619743392459',
     'X-IG-Capabilities': '3brTvw==',
     'Accept-Language': 'en-US',
@@ -369,10 +369,10 @@ async function fetchStories(username, storyId) {
   if (!uid) return { title: '', media: [], authError: sawAuthError };
 
   const tryEndpoints = [
+    'https://i.instagram.com/api/v1/feed/user/' + uid + '/reel_media/',
     'https://i.instagram.com/api/v1/feed/reels_media/?reel_ids=' + uid,
     'https://i.instagram.com/api/v1/feed/user/' + uid + '/story/',
     'https://www.instagram.com/api/v1/feed/reels_media/?reel_ids=' + uid,
-    'https://www.instagram.com/api/v1/feed/user/' + uid + '/story/',
   ];
 
   for (const ep of tryEndpoints) {
