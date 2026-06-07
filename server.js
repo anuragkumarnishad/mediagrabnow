@@ -196,7 +196,7 @@ async function fetchViaRapidAPI(rawUrl) {
 
     items.forEach((it) => {
       if (it && it.meta && it.meta.title && title === 'Instagram post') {
-        title = String(it.meta.title).slice(0, 90);
+        title = String(it.meta.title).slice(0, 200);
       }
       const thumb = it.pictureUrl || it.thumbnail || (it.meta && it.meta.pictureUrl) || '';
       const variants = Array.isArray(it.urls) ? it.urls : [];
@@ -271,7 +271,7 @@ async function fetchViaDocId(shortcode, baseHeaders) {
         const media = out.filter((m) => m.url && !seen.has(m.url) && seen.add(m.url));
         if (media.length) {
           const title =
-            (item.caption && item.caption.text && item.caption.text.slice(0, 80)) ||
+            (item.caption && item.caption.text && item.caption.text.slice(0, 200)) ||
             'Instagram post';
           return { title, media };
         }
@@ -634,11 +634,11 @@ app.post('/api/download', async (req, res) => {
           error: 'Could not fetch this media. Make sure the post/reel is PUBLIC and the link is correct.',
         });
       }
-      // audio mode: mark videos as audio so the frontend offers MP3-style download
+      // audio mode: same video file, but flagged as audio (browser saves the mp4; user can extract audio)
       if (mode === 'audio') {
         result.media = result.media
           .filter((m) => m.type === 'video')
-          .map((m) => ({ ...m, audio: true, quality: 'Audio (MP4)' }));
+          .map((m) => ({ ...m, audio: true, quality: 'Audio' }));
         if (!result.media.length) return res.json({ success: false, error: 'No audio found (this post has no video).' });
       }
     }
@@ -647,12 +647,13 @@ app.post('/api/download', async (req, res) => {
     var kind = mode;
     if (mode === 'profile' || mode === 'viewer') kind = 'profile';
     else if (mode === 'story') kind = 'story';
+    else if (mode === 'audio') kind = 'audio';
     else if (/\/reel|\/reels/i.test(input) || mode === 'reels') kind = 'reel';
     else if (result.media.length > 1) kind = 'carousel';
     else if (result.media[0] && result.media[0].type === 'image') kind = 'photo';
     else kind = 'video';
 
-    res.json({ success: true, title: result.title || 'Instagram media', kind: kind, media: result.media });
+    res.json({ success: true, title: result.title || 'Instagram media', caption: result.title || '', kind: kind, media: result.media });
   } catch (e) {
     res.status(500).json({ success: false, error: 'Server error: ' + e.message });
   }
