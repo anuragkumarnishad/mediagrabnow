@@ -91,6 +91,39 @@ function getShortcode(u) {
   return m ? m[1] : null;
 }
 
+// Parse Instagram's DASH manifest XML to find the highest-quality video MP4 URL.
+// This is where the REAL full-quality file lives (video_versions is often compressed).
+function parseDashVideos(dashXml) {
+  if (!dashXml || typeof dashXml !== 'string') return [];
+  const reps = [];
+  const repRegex = /<Representation\b([^>]*)>([\s\S]*?)<\/Representation>/g;
+  let m;
+  while ((m = repRegex.exec(dashXml)) !== null) {
+    const attrs = m[1] || '';
+    const inner = m[2] || '';
+    // skip audio-only representations
+    if (/mimeType="audio/i.test(attrs)) continue;
+    // must be a video (mimeType video, or has a quality label / frameRate)
+    const isVid = /mimeType="video/i.test(attrs) || /FBQualityLabel=/i.test(attrs) || /frameRate=/i.test(attrs);
+    if (!isVid) continue;
+
+    const height = parseInt((attrs.match(/\bheight="(\d+)"/) || [])[1] || '0', 10);
+    const width = parseInt((attrs.match(/\bwidth="(\d+)"/) || [])[1] || '0', 10);
+    const bandwidth = parseInt((attrs.match(/\bbandwidth="(\d+)"/) || [])[1] || '0', 10);
+    const size = parseInt((attrs.match(/FBContentLength="(\d+)"/) || [])[1] || '0', 10);
+    const label = (attrs.match(/FBQualityLabel="([^"]+)"/) || [])[1] || (height ? height + 'p' : '');
+
+    let url = (inner.match(/<BaseURL>([\s\S]*?)<\/BaseURL>/) || [])[1] || '';
+    url = url.replace(/<!\[CDATA\[|\]\]>/g, '').replace(/&amp;/g, '&').trim();
+    if (url && /^https?:\/\//i.test(url)) {
+      reps.push({ width, height, bandwidth, size, label, url });
+    }
+  }
+  // highest quality first: by height, then bandwidth, then file size
+  reps.sort((a, b) => (b.height - a.height) || (b.bandwidth - a.bandwidth) || (b.size - a.size));
+  return reps;
+}
+
 // Pull every video/image URL out of an Instagram media JSON object
 function extractMedia(node, out) {
   if (!node || typeof node !== 'object') return;
@@ -105,30 +138,70 @@ function extractMedia(node, out) {
     return;
   }
 
-  // GraphQL style
-  if (node.video_url) out.push({ type: 'video', quality: 'HD', url: node.video_url, thumb: node.display_url || node.thumbnail_src || '' });
-  else if (node.display_url && node.is_video === false) out.push({ type: 'image', quality: 'Full', url: node.display_url, thumb: node.display_url });
+  // Detect if this node is a video (any of these signals)
+  const isVideoNode =
+    node.is_video === true ||
+    node.media_type === 2 ||
+    !!node.video_url ||
+    (Array.isArray(node.video_versions) && node.video_versions.length > 0) ||
+    !!node.video_dash_manifest;
 
-  // API v1 style
-  if (Array.isArray(node.video_versions) && node.video_versions.length) {
-    const thumb = (node.image_versions2 && node.image_versions2.candidates && node.image_versions2.candidates[0] && node.image_versions2.candidates[0].url) || '';
-    // Instagram usually serves one video resolution; pick the best, dedupe by height
-    const seenH = new Set();
-    const vids = [];
-    node.video_versions.forEach((v) => {
+  if (isVideoNode) {
+    const thumb =
+      (node.image_versions2 && node.image_versions2.candidates && node.image_versions2.candidates[0] && node.image_versions2.candidates[0].url) ||
+      node.display_url || node.thumbnail_src || '';
+
+    // 1) HIGHEST QUALITY: parse the DASH manifest (this is the full-size file, e.g. ~15MB)
+    const dashVids = parseDashVideos(node.video_dash_manifest);
+
+    // 2) video_versions array (often medium/compressed)
+    const vvSeen = new Set();
+    const vvVids = [];
+    (node.video_versions || []).forEach((v) => {
       const h = v.height || 0;
-      if (!seenH.has(h)) { seenH.add(h); vids.push({ height: h, url: v.url }); }
+      if (v.url && !vvSeen.has(h)) { vvSeen.add(h); vvVids.push({ height: h, width: v.width || 0, url: v.url }); }
     });
-    vids.sort((a, b) => b.height - a.height);
-    const best = vids[0];
-    out.push({
-      type: 'video',
-      quality: best.height ? best.height + 'p' : 'HD',
-      url: best.url,
-      thumb,
-      variants: vids.map((v) => ({ label: (v.height ? v.height + 'p' : 'HD'), url: v.url })),
+    vvVids.sort((a, b) => b.height - a.height);
+
+    // 3) single video_url fallback
+    // Merge all sources, dedupe by URL, keep highest resolution at top.
+    // DASH first (full quality), then video_versions, then single video_url.
+    const all = [];
+    dashVids.forEach((v) => all.push({ height: v.height, label: v.label || (v.height ? v.height + 'p' : 'HD'), url: v.url }));
+    vvVids.forEach((v) => all.push({ height: v.height, label: (v.height ? v.height + 'p' : 'HD'), url: v.url }));
+    if (node.video_url) all.push({ height: 0, label: 'HD', url: node.video_url });
+
+    const urlSeen = new Set();
+    const merged = all.filter((v) => v.url && !urlSeen.has(v.url) && urlSeen.add(v.url));
+    // dedupe by height (keep first = highest, since DASH is sorted high->low)
+    const hSeen = new Set();
+    const finalVids = [];
+    merged.forEach((v) => {
+      const key = v.height || ('u' + v.url.slice(-12));
+      if (!hSeen.has(key)) { hSeen.add(key); finalVids.push(v); }
     });
-  } else if (node.image_versions2 && node.image_versions2.candidates && node.image_versions2.candidates.length && !node.video_versions) {
+    finalVids.sort((a, b) => b.height - a.height);
+
+    if (finalVids.length) {
+      const best = finalVids[0];
+      out.push({
+        type: 'video',
+        quality: best.label || (best.height ? best.height + 'p' : 'HD'),
+        url: best.url,
+        thumb,
+        variants: finalVids.map((v) => ({ label: v.label || (v.height ? v.height + 'p' : 'HD'), url: v.url })),
+      });
+      return; // done with this node
+    }
+  }
+
+  // GraphQL image style
+  if (!isVideoNode && node.display_url && (node.is_video === false || node.media_type === 1) && !(node.image_versions2 && node.image_versions2.candidates)) {
+    out.push({ type: 'image', quality: 'Full', url: node.display_url, thumb: node.display_url });
+  }
+
+  // API v1 image style
+  if (node.image_versions2 && node.image_versions2.candidates && node.image_versions2.candidates.length && !isVideoNode) {
     const cands = node.image_versions2.candidates;
     const best = cands[0];
     // build quality variants from all candidate sizes (dedupe by width)
