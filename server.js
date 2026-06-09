@@ -151,29 +151,27 @@ function extractMedia(node, out) {
       (node.image_versions2 && node.image_versions2.candidates && node.image_versions2.candidates[0] && node.image_versions2.candidates[0].url) ||
       node.display_url || node.thumbnail_src || '';
 
-    // 1) HIGHEST QUALITY: parse the DASH manifest (this is the full-size file, e.g. ~15MB)
-    const dashVids = parseDashVideos(node.video_dash_manifest);
+    // IMPORTANT: Instagram's DASH manifest splits VIDEO and AUDIO into separate tracks,
+    // so a DASH video URL has NO sound. Without ffmpeg we can't merge them.
+    // video_versions / video_url are PROGRESSIVE (muxed) files = video + audio together.
+    // So we ALWAYS prefer muxed sources to guarantee the download has sound.
 
-    // 2) video_versions array (often medium/compressed)
+    // 1) video_versions array (muxed: video + audio) -- dedupe by height, highest first
     const vvSeen = new Set();
     const vvVids = [];
     (node.video_versions || []).forEach((v) => {
       const h = v.height || 0;
-      if (v.url && !vvSeen.has(h)) { vvSeen.add(h); vvVids.push({ height: h, width: v.width || 0, url: v.url }); }
+      if (v.url && !vvSeen.has(h)) { vvSeen.add(h); vvVids.push({ height: h, label: (h ? h + 'p' : 'HD'), url: v.url }); }
     });
     vvVids.sort((a, b) => b.height - a.height);
 
-    // 3) single video_url fallback
-    // Merge all sources, dedupe by URL, keep highest resolution at top.
-    // DASH first (full quality), then video_versions, then single video_url.
+    // 2) build final list from MUXED sources only (sound guaranteed)
     const all = [];
-    dashVids.forEach((v) => all.push({ height: v.height, label: v.label || (v.height ? v.height + 'p' : 'HD'), url: v.url }));
-    vvVids.forEach((v) => all.push({ height: v.height, label: (v.height ? v.height + 'p' : 'HD'), url: v.url }));
+    vvVids.forEach((v) => all.push(v));
     if (node.video_url) all.push({ height: 0, label: 'HD', url: node.video_url });
 
     const urlSeen = new Set();
     const merged = all.filter((v) => v.url && !urlSeen.has(v.url) && urlSeen.add(v.url));
-    // dedupe by height (keep first = highest, since DASH is sorted high->low)
     const hSeen = new Set();
     const finalVids = [];
     merged.forEach((v) => {
