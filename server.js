@@ -124,6 +124,23 @@ function parseDashVideos(dashXml) {
   return reps;
 }
 
+// Pull the AUDIO-ONLY track URL from a DASH manifest (m4a, no video).
+// Lets us offer real audio download without ffmpeg.
+function parseDashAudio(dashXml) {
+  if (!dashXml || typeof dashXml !== 'string') return '';
+  const repRegex = /<Representation\b([^>]*)>([\s\S]*?)<\/Representation>/g;
+  let m, best = '', bestBw = -1;
+  while ((m = repRegex.exec(dashXml)) !== null) {
+    const attrs = m[1] || '', inner = m[2] || '';
+    if (!/mimeType="audio/i.test(attrs)) continue;
+    const bw = parseInt((attrs.match(/\bbandwidth="(\d+)"/) || [])[1] || '0', 10);
+    let url = (inner.match(/<BaseURL>([\s\S]*?)<\/BaseURL>/) || [])[1] || '';
+    url = url.replace(/<!\[CDATA\[|\]\]>/g, '').replace(/&amp;/g, '&').trim();
+    if (url && /^https?:\/\//i.test(url) && bw > bestBw) { bestBw = bw; best = url; }
+  }
+  return best;
+}
+
 // Pull every video/image URL out of an Instagram media JSON object
 function extractMedia(node, out) {
   if (!node || typeof node !== 'object') return;
@@ -180,6 +197,9 @@ function extractMedia(node, out) {
     });
     finalVids.sort((a, b) => b.height - a.height);
 
+    // pure audio track from DASH (m4a, no video) -> real audio download without ffmpeg
+    const audioUrl = parseDashAudio(node.video_dash_manifest);
+
     if (finalVids.length) {
       const best = finalVids[0];
       out.push({
@@ -187,6 +207,7 @@ function extractMedia(node, out) {
         quality: best.label || (best.height ? best.height + 'p' : 'HD'),
         url: best.url,
         thumb,
+        audioUrl: audioUrl || '',
         variants: finalVids.map((v) => ({ label: v.label || (v.height ? v.height + 'p' : 'HD'), url: v.url })),
       });
       return; // done with this node
@@ -297,6 +318,69 @@ async function fetchViaRapidAPI(rawUrl) {
   } catch (e) {
     return null;
   }
+}
+
+// Fetch STORIES via RapidAPI (works from datacenter IP, unlike direct IG story endpoints)
+async function fetchStoriesViaRapidAPI(username) {
+  if (!RAPIDAPI_KEY) return null;
+  username = String(username).replace(/^@/, '').trim();
+  try {
+    const res = await fetch('https://' + RAPIDAPI_HOST + '/api/instagram/stories', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': RAPIDAPI_HOST },
+      body: JSON.stringify({ username }),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const items = Array.isArray(json) ? json : (json && json.result ? json.result : []);
+    if (!items.length) return null;
+    const media = [];
+    items.forEach((it) => extractMedia(it, media));
+    const seen = new Set();
+    const uniq = media.filter((m) => m.url && !seen.has(m.url) && seen.add(m.url));
+    if (uniq.length) return { title: '@' + username + ' — stories', media: uniq };
+    return null;
+  } catch (e) { return null; }
+}
+
+// Fetch HIGHLIGHTS via RapidAPI. Two-step: get highlight list, then its stories.
+async function fetchHighlightsViaRapidAPI(username, highlightId) {
+  if (!RAPIDAPI_KEY) return null;
+  username = String(username || '').replace(/^@/, '').trim();
+  try {
+    // If we already have a highlight id, get its stories directly
+    let hid = highlightId || '';
+    if (!hid && username) {
+      // get the user's highlight albums, pick the first
+      const r1 = await fetch('https://' + RAPIDAPI_HOST + '/api/instagram/highlights', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': RAPIDAPI_HOST },
+        body: JSON.stringify({ username }),
+      });
+      if (r1.ok) {
+        const j1 = await r1.json();
+        const albums = Array.isArray(j1) ? j1 : (j1 && j1.result ? j1.result : []);
+        if (albums.length && albums[0].id) hid = String(albums[0].id).replace(/^highlight:/, '');
+      }
+    }
+    if (!hid) return null;
+    // get the stories inside that highlight (endpoint is camelCase, id needs highlight: prefix)
+    const r2 = await fetch('https://' + RAPIDAPI_HOST + '/api/instagram/highlightStories', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': RAPIDAPI_HOST },
+      body: JSON.stringify({ highlightId: 'highlight:' + hid }),
+    });
+    if (!r2.ok) return null;
+    const j2 = await r2.json();
+    const items = Array.isArray(j2) ? j2 : (j2 && j2.result ? j2.result : []);
+    if (!items.length) return null;
+    const media = [];
+    items.forEach((it) => extractMedia(it, media));
+    const seen = new Set();
+    const uniq = media.filter((m) => m.url && !seen.has(m.url) && seen.add(m.url));
+    if (uniq.length) return { title: '@' + (username || 'instagram') + ' — highlights', media: uniq };
+    return null;
+  } catch (e) { return null; }
 }
 
 // BEST METHOD: mimic Instagram web browser GraphQL request (no auth required)
@@ -674,13 +758,23 @@ app.post('/api/download', async (req, res) => {
       if (!un) return res.json({ success: false, error: 'Enter an Instagram username (e.g. @nasa).' });
       result = await fetchProfilePic(un);
       if (!result.media.length) return res.json({ success: false, error: 'Could not fetch this profile. Check the username.' });
+    } else if (mode === 'highlights') {
+      const un = usernameFromInput();
+      const hid = highlightIdFromInput();
+      // RapidAPI first (works from datacenter), then direct fallback
+      result = (await fetchHighlightsViaRapidAPI(un, hid)) || (hid ? await fetchHighlights(hid) : { title: '', media: [] });
+      if (!result.media.length) {
+        return res.json({ success: false, error: 'Could not fetch highlights. Make sure the account is public and has highlights.' });
+      }
+      res.json({ success: true, title: result.title || 'Instagram highlights', kind: 'story', media: result.media });
+      return;
     } else if (mode === 'story') {
       // highlight link?
       const hid = highlightIdFromInput();
       if (hid) {
-        result = await fetchHighlights(hid);
+        // RapidAPI first, then direct
+        result = (await fetchHighlightsViaRapidAPI('', hid)) || await fetchHighlights(hid);
         if (!result.media.length) {
-          if (result.authError) return res.json({ success: false, error: 'Server session expired. Admin needs to refresh IG_COOKIE.' });
           return res.json({ success: false, error: 'Could not fetch this highlight. Make sure the link is correct and public.' });
         }
         res.json({ success: true, title: result.title || 'Instagram highlight', kind: 'story', media: result.media });
@@ -688,9 +782,9 @@ app.post('/api/download', async (req, res) => {
       }
       const un = usernameFromInput();
       if (!un) return res.json({ success: false, error: 'Paste a story link (instagram.com/stories/...) or enter a username.' });
-      result = await fetchStories(un, storyIdFromInput());
+      // RapidAPI first (works from datacenter IP), then direct method as fallback
+      result = (await fetchStoriesViaRapidAPI(un)) || await fetchStories(un, storyIdFromInput());
       if (!result.media.length) {
-        if (result.authError) return res.json({ success: false, error: 'Login session expired on the server. The site admin needs to refresh the IG_COOKIE.' });
         return res.json({ success: false, error: 'No active public stories found for this user (they may have no story right now, or the account is private).' });
       }
     } else {
@@ -705,11 +799,19 @@ app.post('/api/download', async (req, res) => {
           error: 'Could not fetch this media. Make sure the post/reel is PUBLIC and the link is correct.',
         });
       }
-      // audio mode: same video file, but flagged as audio (browser saves the mp4; user can extract audio)
+      // audio mode: serve the PURE AUDIO track (m4a from DASH) so the user gets sound only,
+      // not the whole video. Falls back to the video file only if no separate audio track exists.
       if (mode === 'audio') {
         result.media = result.media
           .filter((m) => m.type === 'video')
-          .map((m) => ({ ...m, audio: true, quality: 'Audio' }));
+          .map((m) => ({
+            type: 'video',
+            audio: true,
+            quality: 'Audio',
+            url: m.audioUrl || m.url,          // prefer real audio-only URL
+            isPureAudio: !!m.audioUrl,         // true when we have a separate audio track
+            thumb: m.thumb || '',
+          }));
         if (!result.media.length) return res.json({ success: false, error: 'No audio found (this post has no video).' });
       }
     }
